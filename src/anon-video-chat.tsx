@@ -1,32 +1,27 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
-// ==================== SUPABASE CONFIG - USE YOUR VALUES ====================
+// ==================== SUPABASE CONFIG ====================
 const SUPABASE_URL = 'https://xuakgolssjfoohntjidf.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh1YWtnb2xzc2pmb29obnRqaWRmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjMyMTIyNjEsImV4cCI6MjA3ODc4ODI2MX0.QvxEO0ww_ATqIWt9FAswgp06epMeNyCV_0Qoa508Lto';
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ==================== UTILITIES ====================
-
 function generateSessionId(): string {
   return 'sess_' + Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map(b => b.toString(16).padStart(2, '0')).join('');
 }
-
 function generateMatchId(): string {
   return 'match_' + Date.now() + '_' + Math.random().toString(36).slice(2, 11);
 }
 
-// ==================== SUPABASE FUNCTION REPLACEMENTS ====================
-
-// Presence management
+// ==================== SUPABASE INTEGRATION ====================
 async function upsertPresence(sessionId: string, status: 'waiting' | 'in_call' | 'offline' = 'waiting') {
   await supabase
     .from('sessions')
     .upsert([{ id: sessionId, status, last_heartbeat: new Date().toISOString() }]);
   return { data: { session_id: sessionId }, error: null };
 }
-
 async function getAvailablePeer(sessionId: string): Promise<string | null> {
   const { data } = await supabase
     .from('sessions')
@@ -37,7 +32,6 @@ async function getAvailablePeer(sessionId: string): Promise<string | null> {
     .limit(1);
   return data && data.length ? data[0].id : null;
 }
-
 async function createMatch(sessionId: string, peerId: string) {
   const matchId = generateMatchId();
   await supabase
@@ -53,37 +47,42 @@ async function createMatch(sessionId: string, peerId: string) {
     .eq('id', peerId);
   return { data: { match_id: matchId, peer_id: peerId }, error: null };
 }
-
 async function endMatch(matchId: string) {
   const { data } = await supabase
     .from('matches')
     .select('started_at,session_a,session_b')
     .eq('id', matchId)
     .single();
-
   if (!data) return { error: null };
-
   const duration = Math.floor((Date.now() - new Date(data.started_at).getTime()) / 1000);
-
   await supabase
     .from('matches')
     .update({ ended_at: new Date().toISOString(), duration_seconds: duration })
     .eq('id', matchId);
-
   await supabase
     .from('sessions')
     .update({ status: 'waiting', match_id: null })
     .in('id', [data.session_a, data.session_b]);
-
   return { error: null };
 }
-
-// If you want to implement reporting/blacklisting, add corresponding Supabase tables and functions.
+// --- Supabase signaling for WebRTC ---
+async function sendSignalSupabase(matchId: string, senderId: string, payload: any) {
+  await supabase
+    .from('signals')
+    .insert([{ match_id: matchId, sender_id: senderId, payload: JSON.stringify(payload), created_at: new Date().toISOString() }]);
+}
+async function receiveSignalSupabase(matchId: string, selfId: string) {
+  const { data } = await supabase
+    .from('signals')
+    .select('payload')
+    .eq('match_id', matchId)
+    .neq('sender_id', selfId)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  return data && data.length ? JSON.parse(data[0].payload) : null;
+}
 
 // ==================== COMPONENTS ====================
-
-// The rest of your file (WaitingScreen, VideoCall, ReportModal, Toast, and App)
-// -- no changes except swapping out the MockSupabase method calls for these new async functions above.
 
 function WaitingScreen({ sessionId, onMatchFound }: { sessionId: string; onMatchFound: (matchId: string, peerId: string) => void }) {
   const [searching, setSearching] = useState(true);
@@ -91,15 +90,10 @@ function WaitingScreen({ sessionId, onMatchFound }: { sessionId: string; onMatch
   const matchCheckRef = useRef<number | null>(null);
 
   useEffect(() => {
-    // Initialize presence
     upsertPresence(sessionId, 'waiting');
-
-    // Heartbeat every 5 seconds
     heartbeatRef.current = window.setInterval(() => {
       upsertPresence(sessionId, 'waiting');
     }, 5000);
-
-    // Check for matches every 2 seconds
     matchCheckRef.current = window.setInterval(async () => {
       const peerId = await getAvailablePeer(sessionId);
       if (peerId) {
@@ -110,7 +104,6 @@ function WaitingScreen({ sessionId, onMatchFound }: { sessionId: string; onMatch
         }
       }
     }, 2000);
-
     return () => {
       if (heartbeatRef.current) window.clearInterval(heartbeatRef.current);
       if (matchCheckRef.current) window.clearInterval(matchCheckRef.current);
@@ -148,8 +141,83 @@ function WaitingScreen({ sessionId, onMatchFound }: { sessionId: string; onMatch
   );
 }
 
-// ... VideoCall, ReportModal, Toast and App remain unchanged, except: use endMatch instead of the old method for ending calls; use your video/WebRTC code as before
+// ==================== VIDEO CALL COMPONENT (WEBCAM/WEBRTC) ====================
+function VideoCall({ sessionId, matchId, peerId, onNext }: { sessionId: string; matchId: string; peerId: string | null; onNext: () => void }) {
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [status, setStatus] = useState('connecting');
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
 
+  useEffect(() => {
+    let mounted = true;
+
+    const start = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      if (!mounted) return;
+      setLocalStream(stream);
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      pcRef.current = pc;
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+      pc.ontrack = (event: RTCTrackEvent) => {
+        setRemoteStream(event.streams[0]);
+        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0];
+      };
+      pc.onicecandidate = event => {
+        if (event.candidate && peerId) sendSignalSupabase(matchId, sessionId, { type: 'ice-candidate', candidate: event.candidate });
+      };
+      if (peerId && sessionId < peerId) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await sendSignalSupabase(matchId, sessionId, { type: 'offer', sdp: offer });
+      }
+      const poll = setInterval(async () => {
+        const msg = await receiveSignalSupabase(matchId, sessionId);
+        if (!msg) return;
+        if (msg.type === 'offer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          await sendSignalSupabase(matchId, sessionId, { type: 'answer', sdp: answer });
+        } else if (msg.type === 'answer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          setStatus('connected');
+        } else if (msg.type === 'ice-candidate') {
+          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        }
+      }, 1000);
+
+      return () => clearInterval(poll);
+    };
+
+    start();
+
+    return () => {
+      mounted = false;
+      if (pcRef.current) pcRef.current.close();
+      if (localStream) localStream.getTracks().forEach(t => t.stop());
+      setRemoteStream(null);
+    };
+  }, [sessionId, peerId, matchId]);
+
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center bg-black">
+      <div className="flex gap-4">
+        <video ref={localVideoRef} autoPlay muted playsInline className="w-56 h-56 bg-gray-800 rounded-lg border-2 border-teal-500" />
+        <video ref={remoteVideoRef} autoPlay playsInline className="w-96 h-56 bg-gray-900 rounded-lg border-2 border-blue-400" />
+      </div>
+      <div className="text-white mt-4 text-xl">{status === 'connected' ? 'Connected' : 'Connecting...'}</div>
+      <button className="mt-8 py-2 px-6 bg-red-600 text-white rounded-lg" onClick={onNext}>
+        End & Next
+      </button>
+    </div>
+  );
+}
+
+// ==================== MAIN APP ====================
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [appState, setAppState] = useState<'waiting' | 'in_call'>('waiting');
@@ -184,11 +252,9 @@ export default function App() {
       </div>
     );
   }
-
   if (appState === 'waiting') {
     return <WaitingScreen sessionId={sessionId} onMatchFound={handleMatchFound} />;
   }
-
   return (
     <VideoCall
       sessionId={sessionId}

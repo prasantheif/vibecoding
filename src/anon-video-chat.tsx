@@ -165,21 +165,32 @@ function VideoCall({ sessionId, matchId, peerId, onNext }: { sessionId: string; 
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidate[]>([]);
   const remoteDescriptionSetRef = useRef(false);
+  const channelRef = useRef<any>(null);
 
   useEffect(() => {
     let mounted = true;
 
     const start = async () => {
       try {
+        // Get media stream
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         if (!mounted) return;
         setLocalStream(stream);
         if (localVideoRef.current) localVideoRef.current.srcObject = stream;
 
-        const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        // Create peer connection
+        const pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+          ]
+        });
         pcRef.current = pc;
+
+        // Add local tracks
         stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
+        // Handle remote track
         pc.ontrack = (event: RTCTrackEvent) => {
           if (event.streams && event.streams[0]) {
             setRemoteStream(event.streams[0]);
@@ -187,80 +198,101 @@ function VideoCall({ sessionId, matchId, peerId, onNext }: { sessionId: string; 
           }
         };
 
+        // Handle ICE candidates
         pc.onicecandidate = event => {
-          if (event.candidate && peerId) {
-            sendSignalSupabase(matchId, sessionId, { type: 'ice-candidate', candidate: event.candidate.toJSON() });
+          if (event.candidate && peerId && channelRef.current) {
+            channelRef.current.send({
+              type: 'broadcast',
+              event: 'signal',
+              payload: { type: 'ice-candidate', candidate: event.candidate.toJSON() }
+            });
           }
         };
 
+        // Connection state changes
         pc.oniceconnectionstatechange = () => {
           const state = pc.iceConnectionState;
-          setStatus(state === 'connected' ? 'connected' : state);
+          if (state === 'connected') {
+            setStatus('connected');
+          } else {
+            setStatus(state);
+          }
         };
 
-        // Only the peer with lower sessionId sends offer
-        if (peerId && sessionId < peerId) {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          await sendSignalSupabase(matchId, sessionId, { type: 'offer', sdp: offer.toJSON() });
-        }
+        // Subscribe to Realtime channel
+        const channel = supabase.channel(`match_${matchId}`);
+        channelRef.current = channel;
 
-        // Poll for all new signals
-        const poll = setInterval(async () => {
-          const msgs = await receiveAllSignalsSupabase(matchId, sessionId);
-          for (const msg of msgs) {
-            try {
-              if (msg.type === 'offer') {
-                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-                remoteDescriptionSetRef.current = true;
+        channel.on('broadcast', { event: 'signal' }, async ({ payload }) => {
+          try {
+            if (payload.type === 'offer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+              remoteDescriptionSetRef.current = true;
 
-                // Add any pending candidates
-                for (const candidate of pendingCandidatesRef.current) {
-                  try {
-                    await pc.addIceCandidate(candidate);
-                  } catch (e) {
-                    console.warn('Failed to add pending ICE candidate', e);
-                  }
-                }
-                pendingCandidatesRef.current = [];
-
-                const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
-                await sendSignalSupabase(matchId, sessionId, { type: 'answer', sdp: answer.toJSON() });
-              } else if (msg.type === 'answer') {
-                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-                remoteDescriptionSetRef.current = true;
-
-                // Add any pending candidates
-                for (const candidate of pendingCandidatesRef.current) {
-                  try {
-                    await pc.addIceCandidate(candidate);
-                  } catch (e) {
-                    console.warn('Failed to add pending ICE candidate', e);
-                  }
-                }
-                pendingCandidatesRef.current = [];
-
-                setStatus('connected');
-              } else if (msg.type === 'ice-candidate') {
-                if (remoteDescriptionSetRef.current) {
-                  try {
-                    await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-                  } catch (e) {
-                    console.warn('Failed to add ICE candidate', e);
-                  }
-                } else {
-                  // Buffer candidate until remote description is set
-                  pendingCandidatesRef.current.push(new RTCIceCandidate(msg.candidate));
+              // Process pending candidates
+              for (const candidate of pendingCandidatesRef.current) {
+                try {
+                  await pc.addIceCandidate(candidate);
+                } catch (e) {
+                  console.warn('Pending candidate error:', e);
                 }
               }
-            } catch (error) {
-              console.error('Error handling signal:', error);
+              pendingCandidatesRef.current = [];
+
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              channel.send({
+                type: 'broadcast',
+                event: 'signal',
+                payload: { type: 'answer', sdp: answer.toJSON() }
+              });
+            } else if (payload.type === 'answer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+              remoteDescriptionSetRef.current = true;
+
+              // Process pending candidates
+              for (const candidate of pendingCandidatesRef.current) {
+                try {
+                  await pc.addIceCandidate(candidate);
+                } catch (e) {
+                  console.warn('Pending candidate error:', e);
+                }
+              }
+              pendingCandidatesRef.current = [];
+            } else if (payload.type === 'ice-candidate') {
+              if (remoteDescriptionSetRef.current) {
+                try {
+                  await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+                } catch (e) {
+                  console.warn('ICE candidate error:', e);
+                }
+              } else {
+                pendingCandidatesRef.current.push(new RTCIceCandidate(payload.candidate));
+              }
+            }
+          } catch (error) {
+            console.error('Signal error:', error);
+          }
+        });
+
+        await channel.subscribe(async (status) => {
+          if (status === 'SUBSCRIBED') {
+            // Send offer if this peer has lower sessionId
+            if (peerId && sessionId < peerId) {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              channel.send({
+                type: 'broadcast',
+                event: 'signal',
+                payload: { type: 'offer', sdp: offer.toJSON() }
+              });
             }
           }
-        }, 500);
+        });
 
-        return () => clearInterval(poll);
+        return () => {
+          channel.unsubscribe();
+        };
       } catch (error) {
         console.error('Error initializing call:', error);
         setStatus('error');
@@ -273,6 +305,7 @@ function VideoCall({ sessionId, matchId, peerId, onNext }: { sessionId: string; 
       mounted = false;
       if (pcRef.current) pcRef.current.close();
       if (localStream) localStream.getTracks().forEach(t => t.stop());
+      if (channelRef.current) channelRef.current.unsubscribe();
     };
   }, [sessionId, peerId, matchId]);
 
@@ -304,10 +337,10 @@ function VideoCall({ sessionId, matchId, peerId, onNext }: { sessionId: string; 
         className="absolute inset-0 w-full h-full object-cover"
       />
 
-      {/* Gradient overlay for better contrast */}
+      {/* Gradient overlay */}
       <div className="absolute inset-0 bg-gradient-to-t from-black/30 to-transparent pointer-events-none"></div>
 
-      {/* Local Video - PiP Corner (WhatsApp Style) */}
+      {/* Local Video - PiP Corner */}
       <div className="absolute bottom-24 right-4 z-40">
         <video
           ref={localVideoRef}
@@ -318,7 +351,7 @@ function VideoCall({ sessionId, matchId, peerId, onNext }: { sessionId: string; 
         />
       </div>
 
-      {/* Status Text */}
+      {/* Status */}
       <div className="absolute top-6 left-1/2 transform -translate-x-1/2 z-30">
         <div className={`px-4 py-2 rounded-full font-semibold text-white ${
           status === 'connected' ? 'bg-green-500' : 'bg-yellow-500'
@@ -327,62 +360,50 @@ function VideoCall({ sessionId, matchId, peerId, onNext }: { sessionId: string; 
         </div>
       </div>
 
-      {/* Controls - Bottom Bar */}
+      {/* Controls */}
       <div className="absolute bottom-0 left-0 right-0 z-30 bg-gradient-to-t from-black/80 to-transparent p-6">
         <div className="flex items-center justify-center gap-4 max-w-2xl mx-auto">
-          {/* Mute Button */}
           <button
             onClick={toggleAudio}
             className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl transition-all ${
-              audioEnabled
-                ? 'bg-gray-700 hover:bg-gray-600 text-white'
-                : 'bg-red-500 hover:bg-red-600 text-white'
+              audioEnabled ? 'bg-gray-700 hover:bg-gray-600 text-white' : 'bg-red-500 hover:bg-red-600 text-white'
             }`}
-            title={audioEnabled ? 'Mute' : 'Unmute'}
           >
             {audioEnabled ? '🎤' : '🔇'}
           </button>
 
-          {/* Video Button */}
           <button
             onClick={toggleVideo}
             className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl transition-all ${
-              videoEnabled
-                ? 'bg-gray-700 hover:bg-gray-600 text-white'
-                : 'bg-red-500 hover:bg-red-600 text-white'
+              videoEnabled ? 'bg-gray-700 hover:bg-gray-600 text-white' : 'bg-red-500 hover:bg-red-600 text-white'
             }`}
-            title={videoEnabled ? 'Stop Video' : 'Start Video'}
           >
             {videoEnabled ? '📹' : '🚫'}
           </button>
 
-          {/* End Call Button */}
           <button
             onClick={async () => {
               if (matchId) await endMatch(matchId);
               onNext();
             }}
             className="w-16 h-16 rounded-full bg-red-600 hover:bg-red-700 flex items-center justify-center text-white font-bold text-2xl shadow-lg"
-            title="End Call"
           >
             📞
           </button>
 
-          {/* Next Button */}
           <button
             onClick={async () => {
               if (matchId) await endMatch(matchId);
               onNext();
             }}
             className="w-14 h-14 rounded-full bg-teal-500 hover:bg-teal-600 flex items-center justify-center text-white font-bold text-lg"
-            title="End & Next"
           >
             ⏭️
           </button>
         </div>
       </div>
 
-      {/* Loading Spinner if Connecting */}
+      {/* Loading */}
       {status !== 'connected' && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <div className="text-center">
@@ -394,6 +415,7 @@ function VideoCall({ sessionId, matchId, peerId, onNext }: { sessionId: string; 
     </div>
   );
 }
+
 
 // ==================== MAIN APP ====================
 export default function App() {
